@@ -1,7 +1,8 @@
 /**
- * 通用 Markdown 文本处理框架
+ * 通用数学公式文本处理框架
  * ✅ 适用于 QuickAdd Macro
- * ✅ 可扩展多个文本转换函数
+ * ✅ 自动拆分内联数学公式中的非 ASCII 字符
+ * ✅ 保持数学公式的结构完整
  * ✅ 替换后保持原有选中区域
  */
 async function processSelectedText(transformFunctions) {
@@ -33,7 +34,7 @@ async function processSelectedText(transformFunctions) {
         return;
     }
 
-    // 记录原始选区起始位置
+    // 记录原始选区的起始位置
     const startPos = editor.getCursor("from");
 
     // 依次执行所有传入的文本转换函数
@@ -45,7 +46,7 @@ async function processSelectedText(transformFunctions) {
     // 替换选中的文本
     editor.replaceSelection(modifiedText);
 
-    // 计算新选区
+    // 计算新选区：以 startPos 为起点，根据替换后文本内容计算结束位置
     const lines = modifiedText.split("\n");
     let newEndPos;
     if (lines.length === 1) {
@@ -57,6 +58,87 @@ async function processSelectedText(transformFunctions) {
     // 恢复选区
     editor.setSelection(startPos, newEndPos);
 }
+
+/**
+ * splitMathContent
+ * 将数学公式中顶层（不在括号内）的汉字拆分出来，使其脱离 math 环境，
+ * 同时正确处理 \text{} 和空的花括号 {}。
+ * 处理结果为：math 部分保持原样，顶层汉字直接输出文本。
+ */
+function splitMathContent(content) {
+    let segments = [];
+    let currentSegment = "";
+    let currentType = "math";
+    let depth = 0;
+    let i = 0;
+    // 判断是否为汉字（CJK 范围）
+    const isChinese = (ch) => /[\u4E00-\u9FFF]/.test(ch);
+    const flushSegment = () => {
+        if (currentSegment) {
+            segments.push({ type: currentType, text: currentSegment });
+            currentSegment = "";
+        }
+    };
+    while (i < content.length) {
+        const ch = content[i];
+        // 处理 \text{...} 命令
+        if (content.startsWith("\\text{", i)) {
+            flushSegment();
+            i += 6; // 跳过 "\text{"
+            let textContent = "";
+            let braceDepth = 1;
+            while (i < content.length && braceDepth > 0) {
+                if (content[i] === '{') braceDepth++;
+                else if (content[i] === '}') braceDepth--;
+                if (braceDepth > 0) textContent += content[i];
+                i++;
+            }
+            segments.push({ type: "math", text: "\\text{" + textContent + "}" });
+            currentType = "math";
+            continue;
+        }
+        // 处理空的花括号 {}
+        if (content.startsWith("{}", i)) {
+            currentSegment += "{}";
+            i += 2;
+            continue;
+        }
+        // 更新括号层级
+        if ("{([".includes(ch)) {
+            currentSegment += ch;
+            depth++;
+            i++;
+            continue;
+        }
+        if ("})]".includes(ch)) {
+            currentSegment += ch;
+            if (depth > 0) depth--;
+            i++;
+            continue;
+        }
+        // 判断字符类型：顶层汉字归为 text，其它归为 math
+        const charType = (depth === 0 && isChinese(ch)) ? "text" : "math";
+        if (currentType !== charType) {
+            flushSegment();
+            currentType = charType;
+        }
+        currentSegment += ch;
+        i++;
+    }
+    flushSegment();
+    // 合并相邻相同类型片段
+    const merged = segments.reduce((acc, seg) => {
+        if (acc.length && acc[acc.length - 1].type === seg.type) {
+            acc[acc.length - 1].text += seg.text;
+        } else {
+            acc.push(seg);
+        }
+        return acc;
+    }, []);
+    // 重组字符串：math 类型保持原样，text 类型直接输出
+    return merged.map(seg => seg.text).join("");
+}
+
 
 /**
  * 公式内 Unicode 包裹（仅处理单行内联数学公式，不处理 $$...$$ 块）

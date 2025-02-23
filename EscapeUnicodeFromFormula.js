@@ -11,42 +11,28 @@ async function processSelectedText(transformFunctions) {
         new Notice("No file is currently open.");
         return;
     }
-
-    // 允许的文件类型
     const validExtensions = ["md", "canvas"];
     if (!validExtensions.includes(activeFile.extension)) {
         new Notice("The active file is not a Markdown or Canvas file.");
         return;
     }
-
-    // 获取当前活动的编辑器
     const editor = app.workspace.activeEditor?.editor;
     if (!editor) {
         new Notice("No active editor found.");
         return;
     }
-
-    // 确保编辑器处于编辑模式，并获取最新选区
     editor.focus();
     let selection = editor.getSelection();
     if (!selection || selection.trim() === "") {
         new Notice("No text is selected.");
         return;
     }
-
-    // 记录原始选区的起始位置
     const startPos = editor.getCursor("from");
-
-    // 依次执行所有传入的文本转换函数
     let modifiedText = selection;
     for (const transformFunction of transformFunctions) {
         modifiedText = transformFunction(modifiedText);
     }
-
-    // 替换选中的文本
     editor.replaceSelection(modifiedText);
-
-    // 计算新选区：以 startPos 为起点，根据替换后文本内容计算结束位置
     const lines = modifiedText.split("\n");
     let newEndPos;
     if (lines.length === 1) {
@@ -54,125 +40,301 @@ async function processSelectedText(transformFunctions) {
     } else {
         newEndPos = { line: startPos.line + lines.length - 1, ch: lines[lines.length - 1].length };
     }
-
-    // 恢复选区
     editor.setSelection(startPos, newEndPos);
 }
 
 /**
- * 处理 LaTeX 数学公式
- * ✅ 拆分顶层非 ASCII 字符
- * ✅ 保持 \text{} 结构完整
- * ✅ 保持 \left ... \right、\begin{}、\end{} 结构完整
+ * splitAlignedLines
+ * ------------------
+ * 按字符解析 aligned 环境内部内容，严格按照深度拆分行：
+ * 只有在当前大括号和透明环境（非 aligned 环境）均未开启时，
+ * 才将遇到的 "\\" 或换行符 "\n" 视为行分隔符。
  */
-function processInlineMath(formula) {
-    let output = "";
-    let mathBuffer = "";
-    let depth = 0;
+function splitAlignedLines(content) {
+    let lines = [];
+    let currentLine = "";
     let i = 0;
-
-    while (i < formula.length) {
-        const char = formula[i];
-        const isAscii = char.charCodeAt(0) < 128;
-
-        // 处理顶层 \text{...}
-        if (formula.startsWith("\\text{", i) && depth === 0) {
-            if (mathBuffer.trim() !== "") {
-                output += "$" + mathBuffer.trim() + "$ ";
-                mathBuffer = "";
-            }
-            i += 6; // 跳过 "\text{"
-            let inner = "";
-            let braceDepth = 1;
-            while (i < formula.length && braceDepth > 0) {
-                if (formula[i] === '{') braceDepth++;
-                else if (formula[i] === '}') braceDepth--;
-                if (braceDepth > 0) inner += formula[i];
+    let depth = 0;
+    while (i < content.length) {
+        // 如果遇到 \begin{，检测环境名
+        if (content.startsWith("\\begin{", i)) {
+            // 记录起始位置
+            let startEnv = i;
+            i += 7; // 跳过 "\begin{"
+            let envName = "";
+            while (i < content.length && content[i] !== "}") {
+                envName += content[i];
                 i++;
             }
-            output += inner;
+            if (i < content.length) i++; // 跳过 "}"
+            // 如果环境名不是 aligned，则视为透明区域，
+            // 直接复制整个块（直到对应 \end{envName}）并不改变深度
+            if (envName !== "aligned") {
+                let block = "\\begin{" + envName + "}";
+                while (i < content.length) {
+                    if (content.startsWith("\\end{" + envName + "}", i)) {
+                        block += "\\end{" + envName + "}";
+                        i += ("\\end{" + envName + "}").length;
+                        break;
+                    } else {
+                        block += content[i];
+                        i++;
+                    }
+                }
+                currentLine += block;
+                continue;
+            }
+            // 若遇到 aligned 自身，则通常不会嵌套，故不在此处理
+        }
+        // 处理 \text{…}：复制整个 \text 块但不改变 depth (内部视为透明)
+        if (content.startsWith("\\text", i)) {
+            let startText = i;
+            i += 5;
+            while (i < content.length && /\s/.test(content[i])) { i++; }
+            if (i < content.length && content[i] === '{') {
+                // 复制整个 \text{...}
+                let textBlock = "\\text{";
+                i++; // 跳过 "{"
+                let braceCount = 1;
+                while (i < content.length && braceCount > 0) {
+                    if (content[i] === '{') { braceCount++; }
+                    else if (content[i] === '}') { braceCount--; }
+                    textBlock += content[i];
+                    i++;
+                }
+                currentLine += textBlock;
+                continue;
+            }
+        }
+        // 遇到 "{" 和 "}" 修改深度
+        if (content[i] === '{') {
+            depth++;
+            currentLine += content[i];
+            i++;
             continue;
         }
-
-        // 处理 \left ... \right 结构
-        if (formula.startsWith("\\left", i)) {
-            let match = formula.slice(i).match(/^\\left\s*(\\?.)/);
-            if (match) {
-                depth++;
-                mathBuffer += match[0];
-                i += match[0].length;
-                continue;
-            }
-        }
-        if (formula.startsWith("\\right", i)) {
-            let match = formula.slice(i).match(/^\\right\s*(\\?.)/);
-            if (match) {
-                depth--;
-                mathBuffer += match[0];
-                i += match[0].length;
-                continue;
-            }
-        }
-
-        // 处理 \begin{...} 和 \end{...}
-        if (formula.startsWith("\\begin{", i)) {
-            let bracePos = formula.indexOf("}", i + 7);
-            if (bracePos !== -1) {
-                mathBuffer += formula.substring(i, bracePos + 1);
-                depth++;
-                i = bracePos;
-            }
-        } else if (formula.startsWith("\\end{", i)) {
-            let bracePos = formula.indexOf("}", i + 5);
-            if (bracePos !== -1) {
-                mathBuffer += formula.substring(i, bracePos + 1);
-                depth--;
-                i = bracePos;
-            }
-        }
-        // 处理普通 LaTeX 命令，如 \frac
-        else if (char === '\\') {
-            mathBuffer += char;
-            i++;
-            while (i < formula.length && /[a-zA-Z]/.test(formula[i])) {
-                mathBuffer += formula[i];
-                i++;
-            }
-            i--;
-        }
-        // 处理分组符号 { [ ( 及对应闭合符号
-        else if ("{([".includes(char)) {
-            depth++;
-            mathBuffer += char;
-        } else if (")}]".includes(char)) {
+        if (content[i] === '}') {
             depth--;
-            mathBuffer += char;
+            currentLine += content[i];
+            i++;
+            continue;
         }
-        // 顶层（depth === 0）遇到非 ASCII 字符时拆分
-        else if (depth === 0 && !isAscii) {
-            if (mathBuffer.trim() !== "") {
-                output += "$" + mathBuffer.trim() + "$ ";
-                mathBuffer = "";
-            }
-            output += char;
-        } else {
-            mathBuffer += char;
+        // 只有在 depth==0时识别 "\\" 或 "\n" 作为行分隔符
+        if (depth === 0 && content.startsWith("\\\\", i)) {
+            lines.push(currentLine.trim());
+            currentLine = "";
+            i += 2;
+            continue;
         }
+        if (depth === 0 && content[i] === "\n") {
+            lines.push(currentLine.trim());
+            currentLine = "";
+            i++;
+            continue;
+        }
+        // 其他字符直接复制
+        currentLine += content[i];
         i++;
     }
-
-    if (mathBuffer.trim() !== "") {
-        output += "$" + mathBuffer.trim() + "$";
+    if (currentLine.trim() !== "") {
+        lines.push(currentLine.trim());
     }
-    return output;
+    return lines;
 }
 
-// 让 QuickAdd 执行 Macro
-module.exports = async (params) => {
-    await processSelectedText([
-        (selection) =>
-            selection.replace(/\$([^$]+)\$/gs, (_, content) => processInlineMath(content))
-    ]);
+/**
+ * processLine
+ * -----------
+ * 按字符解析一行公式内容，严格计算结构深度。
+ *
+ * - 对于大括号 "{" 与 "}" 修改深度。
+ * - 遇到 "\text{…}" 时递归调用自身（深度减1），内部输出纯文字（去除命令及大括号）。
+ * - 遇到 "\begin{...}" 时，如果环境名不为 "aligned"（如 matrix 使用的 array 等），则原样复制（透明区域）。
+ * - 仅在局部深度为 0 时删除对齐符号 "&"。
+ * - 当 (depth + baseDepth) ≤ 0 且遇到非 ASCII 字符时，拆分为 text 部分。
+ *
+ * 参数 baseDepth 用于对外层环境（例如 aligned 拆分后）的初始补正（aligned 内传 -1）。
+ */
+function processLine(line, baseDepth) {
+    let segments = [];
+    let currentSegment = "";
+    let currentType = "math";
+    let depth = 0;
+    for (let i = 0; i < line.length; i++) {
+        let ch = line[i];
+        // 处理透明区域：遇到 "\begin{"，如果环境名不为 "aligned"则复制整个块
+        if (line.startsWith("\\begin{", i)) {
+            let envStart = i;
+            let j = i + 7;
+            let envName = "";
+            while (j < line.length && line[j] !== '}') {
+                envName += line[j];
+                j++;
+            }
+            if (j < line.length) j++; // 跳过 "}"
+            if (envName !== "aligned") {
+                let block = "\\begin{" + envName + "}";
+                let endToken = "\\end{" + envName + "}";
+                let count = 1;
+                while (j < line.length && count > 0) {
+                    if (line.startsWith("\\begin{" + envName + "}", j)) {
+                        count++;
+                        block += "\\begin{" + envName + "}";
+                        j += ("\\begin{" + envName + "}").length;
+                    } else if (line.startsWith(endToken, j)) {
+                        count--;
+                        block += endToken;
+                        j += endToken.length;
+                    } else {
+                        block += line[j];
+                        j++;
+                    }
+                }
+                currentSegment += block;
+                i = j - 1;
+                continue;
+            }
+            // 如果是 aligned，则交由外层处理，不在此处解析
+        }
+        // 对 \left 与 \right 直接复制
+        if (line.startsWith("\\left", i)) {
+            let token = "\\left";
+            i += 5;
+            if (i < line.length) { token += line[i]; }
+            currentSegment += token;
+            continue;
+        }
+        if (line.startsWith("\\right", i)) {
+            let token = "\\right";
+            i += 6;
+            if (i < line.length) { token += line[i]; }
+            currentSegment += token;
+            continue;
+        }
+        // 处理 \text{…} 命令
+        if (line.startsWith("\\text", i)) {
+            if (currentSegment) {
+                segments.push({ type: currentType, text: currentSegment });
+                currentSegment = "";
+            }
+            i += 5;
+            while (i < line.length && /\s/.test(line[i])) { i++; }
+            if (i < line.length && line[i] === '{') {
+                i++; // 跳过 "{"
+                let inner = "";
+                let braceCount = 1;
+                while (i < line.length && braceCount > 0) {
+                    if (line[i] === '{') { braceCount++; }
+                    else if (line[i] === '}') { braceCount--; }
+                    if (braceCount > 0) { inner += line[i]; }
+                    i++;
+                }
+                let innerSegs = processLine(inner, baseDepth - 1);
+                let txt = innerSegs.map(seg => seg.text).join("");
+                segments.push({ type: "text", text: txt });
+                currentType = "math";
+                i--;
+                continue;
+            }
+        }
+        // 更新大括号深度
+        if (ch === '{') {
+            currentSegment += ch;
+            depth++;
+            continue;
+        }
+        if (ch === '}') {
+            currentSegment += ch;
+            depth--;
+            continue;
+        }
+        // 仅在局部深度为 0 时删除对齐符号 "&"
+        if (ch === '&' && depth === 0) {
+            continue;
+        }
+        // 如果 (depth + baseDepth) ≤ 0 且遇到非 ASCII 字符，则拆分为纯文字
+        let effectiveDepth = depth + baseDepth;
+        if (effectiveDepth <= 0 && /[^\x00-\x7F]/.test(ch)) {
+            if (currentSegment) {
+                segments.push({ type: currentType, text: currentSegment });
+                currentSegment = "";
+            }
+            segments.push({ type: "text", text: ch });
+            continue;
+        }
+        currentSegment += ch;
+    }
+    if (currentSegment) segments.push({ type: currentType, text: currentSegment });
+    let merged = [];
+    segments.forEach(seg => {
+        if (merged.length && merged[merged.length - 1].type === seg.type) {
+            merged[merged.length - 1].text += seg.text;
+        } else {
+            merged.push(seg);
+        }
+    });
+    return merged;
+}
 
-    new Notice("Text transformation completed.");
+/**
+ * transformAlignedEnvironment
+ * -----------------------------
+ * 处理 math 环境中 \begin{aligned} ... \end{aligned} 部分：
+ * - 删除 \begin{aligned} 与 \end{aligned} 标记；
+ * - 使用 splitAlignedLines 按“深度”拆分行（保证只在顶层拆分）；
+ * - 对每一行调用 processLine（传入 baseDepth = -1）；
+ * - 组装时：数学段（type==="math"）先调用 trim() 后用美元符号包裹（确保无多余空格），文字段直接输出；
+ * - 最后各行用换行符连接。
+ */
+function transformAlignedEnvironment(content) {
+    let inner = content.replace(/\\begin\{aligned\}/, "").replace(/\\end\{aligned\}/, "").trim();
+    let lines = splitAlignedLines(inner);
+    let processedLines = lines.map(line => {
+        let segs = processLine(line, -1);
+        return segs
+            .map(seg => seg.type === "math" ? "$" + seg.text.trim() + "$" : seg.text.trim())
+            .join("");
+    });
+    return processedLines.join("\n");
+}
+
+/**
+ * transformMathEnvironment
+ * --------------------------
+ * 检测 math 环境中是否含有 \begin{aligned} 块，
+ * 如果有，则调用 transformAlignedEnvironment 进行处理，
+ * 返回转换后的结果（不再保留原外层 $ 符号）；否则返回原样。
+ */
+function transformMathEnvironment(content) {
+    if (content.indexOf("\\begin{aligned}") >= 0) {
+        return transformAlignedEnvironment(content);
+    }
+    return content;
+}
+
+/**
+ * transformMathContent
+ * ----------------------
+ * 处理选中的 math 环境，支持 inline ($...$) 与 block ($$...$$) 两种形式。
+ * 如果 math 内容中含有 \begin{aligned} 块，则调用 transformMathEnvironment 进行转换；
+ * 否则保持原样。
+ */
+function transformMathContent(selection) {
+    return selection.replace(/(\${1,2})([\s\S]+?)\1/g, (match, delimiter, content) => {
+        if (content.indexOf("\\begin{aligned}") >= 0) {
+            return transformMathEnvironment(content);
+        }
+        return match;
+    });
+}
+
+// QuickAdd Macro 入口
+module.exports = async (params) => {
+    const processed = await processSelectedText([
+        transformMathContent
+    ]);
+    if (processed) {
+        new Notice("Aligned math content splitting completed.");
+    }
 };
+
