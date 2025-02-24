@@ -46,8 +46,8 @@ async function processSelectedText(transformFunctions) {
 /**
  * splitAlignedLines
  * ------------------
- * 按字符解析 aligned 环境内部内容，严格按照深度拆分行：
- * 只有在当前大括号和透明环境（非 aligned 环境）均未开启时，
+ * 按字符解析对齐环境内部内容，严格按照深度拆分行：
+ * 只有在当前大括号和透明环境（非目标对齐环境）均未开启时，
  * 才将遇到的 "\\" 或换行符 "\n" 视为行分隔符。
  */
 function splitAlignedLines(content) {
@@ -56,9 +56,8 @@ function splitAlignedLines(content) {
     let i = 0;
     let depth = 0;
     while (i < content.length) {
-        // 如果遇到 \begin{，检测环境名
+        // 检测 \begin{…}：若环境名不属于目标对齐环境，则视为透明区域，原样复制
         if (content.startsWith("\\begin{", i)) {
-            // 记录起始位置
             let startEnv = i;
             i += 7; // 跳过 "\begin{"
             let envName = "";
@@ -67,9 +66,8 @@ function splitAlignedLines(content) {
                 i++;
             }
             if (i < content.length) i++; // 跳过 "}"
-            // 如果环境名不是 aligned，则视为透明区域，
-            // 直接复制整个块（直到对应 \end{envName}）并不改变深度
-            if (envName !== "aligned") {
+            // 如果环境名不是目标对齐环境，则复制整个块
+            if (!/^(aligned|align\*?|flalign|split)$/.test(envName)) {
                 let block = "\\begin{" + envName + "}";
                 while (i < content.length) {
                     if (content.startsWith("\\end{" + envName + "}", i)) {
@@ -84,15 +82,14 @@ function splitAlignedLines(content) {
                 currentLine += block;
                 continue;
             }
-            // 若遇到 aligned 自身，则通常不会嵌套，故不在此处理
+            // 若为目标对齐环境，则一般不会嵌套，可忽略此情况
         }
-        // 处理 \text{…}：复制整个 \text 块但不改变 depth (内部视为透明)
+        // 对 \text{…} 复制整个块（内部视为透明，不改变 depth）
         if (content.startsWith("\\text", i)) {
             let startText = i;
             i += 5;
             while (i < content.length && /\s/.test(content[i])) { i++; }
             if (i < content.length && content[i] === '{') {
-                // 复制整个 \text{...}
                 let textBlock = "\\text{";
                 i++; // 跳过 "{"
                 let braceCount = 1;
@@ -106,7 +103,7 @@ function splitAlignedLines(content) {
                 continue;
             }
         }
-        // 遇到 "{" 和 "}" 修改深度
+        // 更新大括号深度
         if (content[i] === '{') {
             depth++;
             currentLine += content[i];
@@ -119,7 +116,7 @@ function splitAlignedLines(content) {
             i++;
             continue;
         }
-        // 只有在 depth==0时识别 "\\" 或 "\n" 作为行分隔符
+        // 只有在 depth==0 时识别 "\\" 或 "\n" 为行分隔符
         if (depth === 0 && content.startsWith("\\\\", i)) {
             lines.push(currentLine.trim());
             currentLine = "";
@@ -147,13 +144,13 @@ function splitAlignedLines(content) {
  * -----------
  * 按字符解析一行公式内容，严格计算结构深度。
  *
- * - 对于大括号 "{" 与 "}" 修改深度。
- * - 遇到 "\text{…}" 时递归调用自身（深度减1），内部输出纯文字（去除命令及大括号）。
- * - 遇到 "\begin{...}" 时，如果环境名不为 "aligned"（如 matrix 使用的 array 等），则原样复制（透明区域）。
- * - 仅在局部深度为 0 时删除对齐符号 "&"。
+ * - 对于大括号 "{" 与 "}" 修改深度；
+ * - 遇到 "\text{…}" 时递归调用自身（深度减1），内部输出纯文字（去除命令及大括号）；
+ * - 遇到 "\begin{...}" 时，如果环境名不为目标对齐环境（如 matrix 使用的 array 等），则原样复制（透明区域）；
+ * - 仅在局部深度为 0 时删除对齐符号 "&"；
  * - 当 (depth + baseDepth) ≤ 0 且遇到非 ASCII 字符时，拆分为 text 部分。
  *
- * 参数 baseDepth 用于对外层环境（例如 aligned 拆分后）的初始补正（aligned 内传 -1）。
+ * 参数 baseDepth 用于对外层环境（例如对齐环境拆分后）的初始补正（目标环境内传 -1）。
  */
 function processLine(line, baseDepth) {
     let segments = [];
@@ -162,7 +159,7 @@ function processLine(line, baseDepth) {
     let depth = 0;
     for (let i = 0; i < line.length; i++) {
         let ch = line[i];
-        // 处理透明区域：遇到 "\begin{"，如果环境名不为 "aligned"则复制整个块
+        // 处理透明区域：遇到 "\begin{", 如果环境名不为目标对齐环境则复制整个块
         if (line.startsWith("\\begin{", i)) {
             let envStart = i;
             let j = i + 7;
@@ -172,7 +169,7 @@ function processLine(line, baseDepth) {
                 j++;
             }
             if (j < line.length) j++; // 跳过 "}"
-            if (envName !== "aligned") {
+            if (!/^(aligned|align\*?|flalign|split)$/.test(envName)) {
                 let block = "\\begin{" + envName + "}";
                 let endToken = "\\end{" + envName + "}";
                 let count = 1;
@@ -194,7 +191,7 @@ function processLine(line, baseDepth) {
                 i = j - 1;
                 continue;
             }
-            // 如果是 aligned，则交由外层处理，不在此处解析
+            // 如果是目标对齐环境，则交由外层处理
         }
         // 对 \left 与 \right 直接复制
         if (line.startsWith("\\left", i)) {
@@ -279,15 +276,19 @@ function processLine(line, baseDepth) {
 /**
  * transformAlignedEnvironment
  * -----------------------------
- * 处理 math 环境中 \begin{aligned} ... \end{aligned} 部分：
- * - 删除 \begin{aligned} 与 \end{aligned} 标记；
- * - 使用 splitAlignedLines 按“深度”拆分行（保证只在顶层拆分）；
- * - 对每一行调用 processLine（传入 baseDepth = -1）；
- * - 组装时：数学段（type==="math"）先调用 trim() 后用美元符号包裹（确保无多余空格），文字段直接输出；
+ * 处理 math 环境中目标对齐环境（如 aligned, align, align*, flalign, split）：
+ * - 使用正则同时删除 \begin{...} 与 \end{...} 标记（对目标环境名统一处理），
+ * - 使用 splitAlignedLines 按当前层级拆分行（保证只在顶层拆分），
+ * - 对每一行调用 processLine（传入 baseDepth = -1），
+ * - 组装时：数学段（type==="math"）调用 trim() 后用美元符号包裹（确保无多余空格），文字段直接输出，
  * - 最后各行用换行符连接。
  */
 function transformAlignedEnvironment(content) {
-    let inner = content.replace(/\\begin\{aligned\}/, "").replace(/\\end\{aligned\}/, "").trim();
+    // 使用正则删除目标环境的开始与结束标记
+    let inner = content
+        .replace(/\\begin\{(?:aligned|align\*?|flalign|split)\}/g, "")
+        .replace(/\\end\{(?:aligned|align\*?|flalign|split)\}/g, "")
+        .trim();
     let lines = splitAlignedLines(inner);
     let processedLines = lines.map(line => {
         let segs = processLine(line, -1);
@@ -298,15 +299,17 @@ function transformAlignedEnvironment(content) {
     return processedLines.join("\n");
 }
 
+
 /**
  * transformMathEnvironment
  * --------------------------
- * 检测 math 环境中是否含有 \begin{aligned} 块，
+ * 检测 math 环境中是否含有目标对齐环境（aligned, align, align*, flalign, split），
  * 如果有，则调用 transformAlignedEnvironment 进行处理，
  * 返回转换后的结果（不再保留原外层 $ 符号）；否则返回原样。
  */
 function transformMathEnvironment(content) {
-    if (content.indexOf("\\begin{aligned}") >= 0) {
+    const envRegex = /\\begin\{(aligned|align\*?|flalign|split)\}/;
+    if (envRegex.test(content)) {
         return transformAlignedEnvironment(content);
     }
     return content;
@@ -316,12 +319,15 @@ function transformMathEnvironment(content) {
  * transformMathContent
  * ----------------------
  * 处理选中的 math 环境，支持 inline ($...$) 与 block ($$...$$) 两种形式。
- * 如果 math 内容中含有 \begin{aligned} 块，则调用 transformMathEnvironment 进行转换；
+ * 如果 math 内容中含有目标对齐环境，则调用 transformMathEnvironment 进行转换；
  * 否则保持原样。
  */
 function transformMathContent(selection) {
     return selection.replace(/(\${1,2})([\s\S]+?)\1/g, (match, delimiter, content) => {
-        if (content.indexOf("\\begin{aligned}") >= 0) {
+        if (content.indexOf("\\begin{aligned}") >= 0 ||
+            content.indexOf("\\begin{align") >= 0 ||
+            content.indexOf("\\begin{flalign") >= 0 ||
+            content.indexOf("\\begin{split}") >= 0) {
             return transformMathEnvironment(content);
         }
         return match;
@@ -337,4 +343,3 @@ module.exports = async (params) => {
         new Notice("Aligned math content splitting completed.");
     }
 };
-
